@@ -1,1 +1,30 @@
-*.venv
+# --- Virtual Environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Byte-compiled / Optimized / DLL files ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- IDEs and Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS Generated Files ---
+.DS_Store
+Thumbs.db
+
+# --- Distribution / Packaging ---
+dist/
+build/
+*.egg-info/
+
+# --- Testing / Coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
