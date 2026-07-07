@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""wtfgit — for when you go "wtf, git?"
+
+Scans your repo (read-only), figures out the most urgent problem, explains it
+in plain English, and shows the exact commands to fix it. Never runs anything
+destructive itself.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional, Tuple
+
+# ---------------------------------------------------------------- colors ----
+
+_USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _c(code: str) -> str:
+    return f"\033[{code}m" if _USE_COLOR else ""
+
+
+RED = _c("31")
+YELLOW = _c("33")
+GREEN = _c("32")
+CYAN = _c("36")
+BLUE = _c("34")
+GRAY = _c("90")
+BOLD = _c("1")
+DIM = _c("2")
+RESET = _c("0")
+
+WIDTH = min(shutil.get_terminal_size().columns, 80)
+
+# ------------------------------------------------------------------- git ----
+
+
+class GitError(Exception):
+    pass
+
+
+def _git(*args: str) -> str:
+    """Run a git command, return stdout. Raises GitError with stderr on failure."""
+    try:
+        result = subprocess.run(
+            ["git", *args], capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        print(f"{RED}git isn't installed (or isn't on your PATH).{RESET}")
+        print("Install it from https://git-scm.com/downloads and try again.")
+        sys.exit(1)
+    if result.returncode != 0:
+        raise GitError(result.stderr.strip())
+    return result.stdout.rstrip("\n")
+
+
+# ----------------------------------------------------------------- state ----
+
+
+@dataclass
+class GitState:
+    branch: str = ""
+    detached: bool = False
+    unborn: bool = False              # repo has no commits yet
+    head_short: str = ""              # short sha, for detached HEAD display
+    upstream: Optional[str] = None
+    ahead: int = 0
+    behind: int = 0
+    staged: List[str] = field(default_factory=list)
+    modified: List[str] = field(default_factory=list)   # unstaged changes/deletes
+    untracked: List[str] = field(default_factory=list)
+    conflicted: List[str] = field(default_factory=list)
+    merging: bool = False
+    rebasing: bool = False
+    cherry_picking: bool = False
+    reverting: bool = False
+    bisecting: bool = False
+    stash_count: int = 0
+    remotes: List[str] = field(default_factory=list)
+    orphan_commits: int = 0           # commits reachable only from detached HEAD
+
+
+def parse_status_v2(raw: str) -> GitState:
+    """Parse `git status --porcelain=v2 --branch` output into a GitState."""
+    s = GitState()
+    for line in raw.splitlines():
+        if line.startswith("# branch.oid "):
+            s.unborn = line.endswith("(initial)")
+        elif line.startswith("# branch.head "):
+            head = line[len("# branch.head "):]
+            if head == "(detached)":
+                s.detached = True
+            else:
+                s.branch = head
+        elif line.startswith("# branch.upstream "):
+            s.upstream = line[len("# branch.upstream "):]
+        elif line.startswith("# branch.ab "):
+            ab = line[len("# branch.ab "):].split()   # ['+2', '-3']
+            s.ahead, s.behind = int(ab[0]), abs(int(ab[1]))
+        elif line.startswith("? "):
+            s.untracked.append(line[2:])
+        elif line.startswith("u "):
+            s.conflicted.append(line.split(" ", 10)[10])
+        elif line.startswith(("1 ", "2 ")):
+            parts = line.split(" ", 9 if line[0] == "2" else 8)
+            xy, path = parts[1], parts[-1].split("\t")[0]
+            if xy[0] != ".":
+                s.staged.append(path)
+            if xy[1] != ".":
+                s.modified.append(path)
+    return s
+
+
+def scan() -> GitState:
+    """Gather everything we need about the repo. All commands are read-only."""
+    git_dir = _git("rev-parse", "--git-dir")
+    state = parse_status_v2(_git("status", "--porcelain=v2", "--branch"))
+
+    # in-progress operations live as marker files inside .git
+    state.merging = os.path.exists(os.path.join(git_dir, "MERGE_HEAD"))
+    state.rebasing = os.path.isdir(os.path.join(git_dir, "rebase-merge")) or \
+        os.path.isdir(os.path.join(git_dir, "rebase-apply"))
+    state.cherry_picking = os.path.exists(os.path.join(git_dir, "CHERRY_PICK_HEAD"))
+    state.reverting = os.path.exists(os.path.join(git_dir, "REVERT_HEAD"))
+    state.bisecting = os.path.exists(os.path.join(git_dir, "BISECT_LOG"))
+
+    stash = _git("stash", "list")
+    state.stash_count = len(stash.splitlines()) if stash else 0
+    remotes = _git("remote")
+    state.remotes = remotes.splitlines() if remotes else []
+
+    if state.detached:
+        state.head_short = _git("rev-parse", "--short", "HEAD")
+        # commits you'd lose by switching away — the real detached-HEAD danger
+        state.orphan_commits = int(
+            _git("rev-list", "--count", "HEAD", "--not", "--branches", "--tags") or 0
+        )
+    return state
+
+
+# ---------------------------------------------------------------- issues ----
+
+
+@dataclass
+class Issue:
+    severity: int          # lower = more urgent
+    title: str
+    why: str               # plain-English explanation
+    fixes: List[Tuple[str, str]]   # (command, what it does)
+
+
+def _files_preview(files: List[str], n: int = 3) -> str:
+    shown = ", ".join(files[:n])
+    more = f" (+{len(files) - n} more)" if len(files) > n else ""
+    return shown + more
+
+
+# Each rule looks at the state and returns an Issue or None.
+# ponytail: plain functions in a list, no rule-engine classes.
+
+def r_merge_conflict(s: GitState) -> Optional[Issue]:
+    if not s.merging:
+        return None
+    if s.conflicted:
+        return Issue(1, "Merge in progress with conflicts",
+            f"You ran a merge and git couldn't combine both sides automatically in: "
+            f"{_files_preview(s.conflicted)}. Git paused the merge and marked the clashing "
+            "sections in those files with <<<<<<< / ======= / >>>>>>> markers. "
+            "Nothing is broken — git is waiting for you to pick which changes to keep.",
+            [("git status", "see the full list of conflicted files"),
+             ("$EDITOR <file>", "open each file, keep the lines you want, delete the markers"),
+             ("git add <file>", "tell git a file's conflict is resolved"),
+             ("git commit", "finish the merge once every file is added"),
+             ("git merge --abort", "or bail out completely and go back to before the merge")])
+    return Issue(1, "Merge in progress (conflicts resolved, not committed)",
+        "You're mid-merge. The conflicts look resolved, but the merge commit hasn't "
+        "been made yet, so the repo is still in a paused state.",
+        [("git commit", "finish the merge"),
+         ("git merge --abort", "or cancel it and return to before the merge")])
+
+
+def r_rebase(s: GitState) -> Optional[Issue]:
+    if not s.rebasing:
+        return None
+    why = ("You're in the middle of a rebase — git is replaying your commits one by one "
+           "onto a new base and stopped partway. ")
+    why += (f"It hit conflicts in: {_files_preview(s.conflicted)}. Fix those files, then continue."
+            if s.conflicted else
+            "It's waiting for you to continue, skip this commit, or abort.")
+    return Issue(2, "Rebase in progress", why,
+        [("git status", "see where the rebase stopped and which files conflict"),
+         ("git add <file>", "mark a conflicted file as fixed (after editing it)"),
+         ("git rebase --continue", "resume replaying commits"),
+         ("git rebase --skip", "drop the current commit and move on"),
+         ("git rebase --abort", "or undo the whole rebase and go back to where you started")])
+
+
+def r_cherry_pick(s: GitState) -> Optional[Issue]:
+    if not s.cherry_picking:
+        return None
+    return Issue(3, "Cherry-pick in progress",
+        "You ran `git cherry-pick` and it stopped — usually because of a conflict. "
+        "Git is waiting for you to resolve it or call the whole thing off.",
+        [("git status", "see what conflicted"),
+         ("git add <file>", "mark conflicts as resolved after editing"),
+         ("git cherry-pick --continue", "finish applying the commit"),
+         ("git cherry-pick --abort", "or cancel and go back")])
+
+
+def r_revert(s: GitState) -> Optional[Issue]:
+    if not s.reverting:
+        return None
+    return Issue(3, "Revert in progress",
+        "You ran `git revert` and it stopped on a conflict. Git needs you to decide "
+        "how the revert applies before it can commit.",
+        [("git status", "see what conflicted"),
+         ("git add <file>", "mark conflicts as resolved after editing"),
+         ("git revert --continue", "finish the revert"),
+         ("git revert --abort", "or cancel it")])
+
+
+def r_bisect(s: GitState) -> Optional[Issue]:
+    if not s.bisecting:
+        return None
+    return Issue(4, "Bisect in progress",
+        "You're mid `git bisect` — git has checked out an old commit so you can test it. "
+        "This also explains why your files may look 'wrong': you're literally in the past.",
+        [("git bisect good", "mark this commit as working, test the next one"),
+         ("git bisect bad", "mark this commit as broken, test the next one"),
+         ("git bisect reset", "or stop bisecting and return to your branch")])
+
+
+def r_conflicts_no_op(s: GitState) -> Optional[Issue]:
+    # unmerged paths but no operation marker — e.g. after a crashed merge
+    if not s.conflicted or s.merging or s.rebasing or s.cherry_picking or s.reverting:
+        return None
+    return Issue(1, "Unresolved conflicts in your files",
+        f"These files still have conflict markers: {_files_preview(s.conflicted)}. "
+        "A previous merge/pull didn't get finished.",
+        [("$EDITOR <file>", "resolve the <<<<<<< / >>>>>>> sections"),
+         ("git add <file>", "mark each file resolved"),
+         ("git commit", "commit the resolution")])
+
+
+def r_detached(s: GitState) -> Optional[Issue]:
+    if not s.detached:
+        return None
+    why = (f"HEAD points directly at commit {s.head_short} instead of a branch — usually "
+           "from checking out a commit hash or tag. New commits made here don't belong "
+           "to any branch. ")
+    if s.orphan_commits:
+        why += (f"⚠ You've already made {s.orphan_commits} commit(s) here that are NOT on any "
+                "branch — if you switch away without saving them, they'll be very hard to recover.")
+        fixes = [("git switch -c rescue-branch", "put your commits on a real branch (do this first!)"),
+                 ("git switch main", "then go back to normal work if you want")]
+    else:
+        why += "You haven't committed anything here, so it's safe to just go back to a branch."
+        fixes = [("git switch main", "go back to your branch (use your branch's name)"),
+                 ("git switch -c new-branch", "or start a branch from this exact commit")]
+    return Issue(5, "Detached HEAD — you're not on a branch", why, fixes)
+
+
+def r_unborn(s: GitState) -> Optional[Issue]:
+    if not s.unborn:
+        return None
+    return Issue(6, "Brand-new repo — no commits yet",
+        "This repo has been initialized but has zero commits, so most git commands "
+        "will complain about a missing HEAD. Totally normal for a fresh `git init`.",
+        [("git add .", "stage your files"),
+         ('git commit -m "initial commit"', "create the first commit")])
+
+
+def r_diverged(s: GitState) -> Optional[Issue]:
+    if not (s.ahead and s.behind):
+        return None
+    return Issue(7, f"Branch diverged from {s.upstream}",
+        f"You have {s.ahead} local commit(s) the remote doesn't have, and the remote has "
+        f"{s.behind} commit(s) you don't have. This happens when you and someone else "
+        "(or you on another machine) both committed since the last sync. A plain "
+        "`git push` will be rejected until you combine the two histories.",
+        [("git pull --rebase", "replay your commits on top of the remote's (clean, linear history)"),
+         ("git pull", "or merge the remote's commits into yours (creates a merge commit)"),
+         ("git push", "then push the combined result")])
+
+
+def r_behind(s: GitState) -> Optional[Issue]:
+    if not (s.behind and not s.ahead):
+        return None
+    return Issue(8, f"Behind {s.upstream} by {s.behind} commit(s)",
+        "The remote has commits you don't have locally yet. Not dangerous, but the "
+        "longer you wait, the more likely you'll hit conflicts later.",
+        [("git pull", "download and apply the remote commits")])
+
+
+def r_no_upstream(s: GitState) -> Optional[Issue]:
+    if s.upstream or not s.remotes or s.detached or s.unborn:
+        return None
+    return Issue(9, f"Branch '{s.branch}' has no upstream",
+        "This branch isn't linked to a branch on the remote, so `git push` and `git pull` "
+        "don't know where to go. Common right after creating a new local branch.",
+        [(f"git push -u origin {s.branch}",
+          "push and link the branch to the remote (the -u makes future push/pull just work)")])
+
+
+def r_ahead(s: GitState) -> Optional[Issue]:
+    if not (s.ahead and not s.behind):
+        return None
+    return Issue(10, f"{s.ahead} unpushed commit(s)",
+        "Your local commits exist only on this machine. If your laptop dies, they die with it.",
+        [("git push", "send them to the remote")])
+
+
+def r_staged(s: GitState) -> Optional[Issue]:
+    if not s.staged or s.merging or s.rebasing:
+        return None
+    return Issue(11, f"{len(s.staged)} file(s) staged but not committed",
+        f"You've `git add`ed changes ({_files_preview(s.staged)}) but haven't committed "
+        "them. They're in the staging area — a waiting room for the next commit.",
+        [('git commit -m "describe your change"', "commit what's staged"),
+         ("git restore --staged <file>", "or un-stage a file (keeps your edits)")])
+
+
+def r_modified(s: GitState) -> Optional[Issue]:
+    if not s.modified or s.conflicted:
+        return None
+    return Issue(12, f"{len(s.modified)} file(s) with unstaged changes",
+        f"You've edited tracked files ({_files_preview(s.modified)}) but haven't staged "
+        "the changes. They exist only in your working directory.",
+        [("git add <file>", "stage a file for the next commit (git add -p to pick chunks)"),
+         ("git diff", "review exactly what you changed"),
+         ("git restore <file>", "or throw the changes away — careful, this is permanent")])
+
+
+def r_untracked(s: GitState) -> Optional[Issue]:
+    if not s.untracked:
+        return None
+    return Issue(13, f"{len(s.untracked)} untracked file(s)",
+        f"Git sees {_files_preview(s.untracked)} but isn't tracking them — they won't be "
+        "in commits until you add them. Build artifacts and secrets should be ignored instead.",
+        [("git add <file>", "start tracking a file"),
+         ("echo '<file>' >> .gitignore", "or tell git to permanently ignore it")])
+
+
+def r_stash(s: GitState) -> Optional[Issue]:
+    if not s.stash_count:
+        return None
+    return Issue(14, f"{s.stash_count} stash(es) sitting around",
+        "You stashed changes at some point and never brought them back. Easy to forget "
+        "about and then wonder where your work went.",
+        [("git stash list", "see what's in there"),
+         ("git stash pop", "restore the most recent stash (and remove it from the list)"),
+         ("git stash drop", "or discard it if it's stale")])
+
+
+def r_no_remote(s: GitState) -> Optional[Issue]:
+    if s.remotes or s.unborn:
+        return None
+    return Issue(15, "No remote configured",
+        "This repo only exists on your machine — there's no GitHub/GitLab/etc. linked, "
+        "so there's no backup and no way to collaborate.",
+        [("git remote add origin <url>", "link a remote repository"),
+         (f"git push -u origin {s.branch or 'main'}", "then push your work to it")])
+
+
+RULES: List[Callable[[GitState], Optional[Issue]]] = [
+    r_merge_conflict, r_rebase, r_cherry_pick, r_revert, r_bisect,
+    r_conflicts_no_op, r_detached, r_unborn, r_diverged, r_behind,
+    r_no_upstream, r_ahead, r_staged, r_modified, r_untracked,
+    r_stash, r_no_remote,
+]
+
+
+def diagnose(s: GitState) -> List[Issue]:
+    issues = [i for rule in RULES if (i := rule(s))]
+    return sorted(issues, key=lambda i: i.severity)
+
+
+# ---------------------------------------------------------------- output ----
+
+
+def _wrap(text: str, indent: str = "   ") -> str:
+    return textwrap.fill(text, WIDTH, initial_indent=indent, subsequent_indent=indent)
+
+
+def _print_fixes(fixes: List[Tuple[str, str]]) -> None:
+    for cmd, what in fixes:
+        print(f"     {CYAN}$ {cmd}{RESET}")
+        print(f"       {GRAY}{what}{RESET}")
+
+
+def print_report(s: GitState, issues: List[Issue]) -> None:
+    print(f"\n{BOLD}wtfgit{RESET} {GRAY}— here's what's going on{RESET}\n")
+
+    # one-line status summary
+    if s.detached:
+        loc = f"{YELLOW}detached HEAD @ {s.head_short}{RESET}"
+    elif s.unborn:
+        loc = f"{YELLOW}{s.branch or '(no branch)'} — no commits yet{RESET}"
+    else:
+        loc = f"{GREEN}{s.branch}{RESET}"
+    sync = ""
+    if s.upstream:
+        sync = f"  {GRAY}→ {s.upstream}{RESET}"
+        if s.ahead:
+            sync += f" {YELLOW}↑{s.ahead}{RESET}"
+        if s.behind:
+            sync += f" {YELLOW}↓{s.behind}{RESET}"
+    print(f" On: {loc}{sync}\n")
+
+    if not issues:
+        print(f" {GREEN}✓ Nothing wtf here — your repo is clean and in sync.{RESET}")
+        return
+
+    urgent, rest = issues[0], issues[1:]
+    urgent_color = RED if urgent.severity <= 6 else YELLOW
+    print(f" {urgent_color}{BOLD}▶ MOST URGENT: {urgent.title}{RESET}")
+    print(_wrap(urgent.why))
+    print(f"\n   {BOLD}How to fix it:{RESET}")
+    _print_fixes(urgent.fixes)
+
+    if rest:
+        print(f"\n {BOLD}Also found:{RESET}")
+        for issue in rest:
+            print(f"\n   {YELLOW}•{RESET} {BOLD}{issue.title}{RESET}")
+            print(_wrap(issue.why, indent="     "))
+            _print_fixes(issue.fixes)
+
+
+def print_graph() -> None:
+    """Recent history, rendered by git itself. ponytail: git's own graph
+    renderer beats anything we'd hand-roll."""
+    try:
+        graph = _git("log", "--graph", "--oneline", "--decorate", "--all",
+                     f"--color={'always' if _USE_COLOR else 'never'}", "-n", "15")
+    except GitError:
+        return  # no commits yet
+    if not graph:
+        return
+    bar = "─" * (WIDTH - 20)
+    print(f"\n {GRAY}── recent history {bar}{RESET}")
+    print(f" {GRAY}(each * is a commit; lines show how branches split and merge;"
+          f" HEAD -> is you){RESET}\n")
+    for line in graph.splitlines():
+        print(f"   {line}")
+    print()
+
+
+# ------------------------------------------------------------------ main ----
+
+
+def main() -> None:
+    if sys.argv[1:]:
+        print(__doc__.strip())
+        print("\nUsage: run `wtfgit` inside a git repository. No flags, no setup.")
+        return
+
+    try:
+        _git("rev-parse", "--git-dir")
+    except GitError:
+        print(f"\n{YELLOW}You're not in a git repository{RESET} — that's the whole wtf.")
+        print("If this folder should be one:")
+        print(f"  {CYAN}$ git init{RESET}          {GRAY}start a fresh repo here{RESET}")
+        print(f"  {CYAN}$ git clone <url>{RESET}   {GRAY}or download an existing one{RESET}")
+        sys.exit(1)
+
+    try:
+        state = scan()
+    except GitError as e:
+        if "index.lock" in str(e):
+            print(f"\n{RED}{BOLD}▶ Git is locked: .git/index.lock exists{RESET}")
+            print(_wrap(
+                "A previous git command crashed (or another one is running right now) "
+                "and left its lock file behind. Every git command will refuse to run "
+                "until it's gone."))
+            print(f"\n   {BOLD}How to fix it:{RESET}")
+            _print_fixes([
+                ("ps aux | grep git", "first make sure no git process is actually running"),
+                ("rm .git/index.lock", "then delete the stale lock file")])
+            sys.exit(1)
+        print(f"{RED}git error:{RESET} {e}")
+        sys.exit(1)
+
+    print_report(state, diagnose(state))
+    print_graph()
+
+
+if __name__ == "__main__":
+    main()
